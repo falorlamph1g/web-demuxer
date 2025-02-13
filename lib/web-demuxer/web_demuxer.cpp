@@ -36,33 +36,42 @@ typedef struct WebAVStream
     std::string codec_name;
     std::string codec_string;
     std::string profile;
-    std::string pix_fmt;
-    std::string color_primaries;
-    std::string color_transfer;
-    std::string color_space;
-    std::string color_range;
     int level;
-    int width;
-    int height;
-    int channels;
-    int sample_rate;
-    std::string sample_fmt;
     std::string bit_rate;
     int extradata_size;
     std::vector<uint8_t> extradata;
     val get_extradata() const{
         return val(typed_memory_view(extradata.size(), extradata.data()));
     }
-    /** Other Info */
+    /** Video-specific Info */
+    int width;
+    int height;
+    std::string pix_fmt;
+    std::string color_primaries;
+    std::string color_transfer;
+    std::string color_space;
+    std::string color_range;
     std::string r_frame_rate;
     std::string avg_frame_rate;
     std::string sample_aspect_ratio;
     std::string display_aspect_ratio;
+    double rotation;
+    /** Audio-specific Info */
+    int channels;
+    int sample_rate;
+    std::string sample_fmt;
+    /** Other Common Info */
     double start_time;
     double duration;
-    double rotation;
     std::string nb_frames;
     std::vector<Tag> tags;
+    val get_tags() const {
+        val tags = val::object();
+        for (const Tag &tag : this->tags) {
+            tags.set(tag.key, tag.value);
+        }
+        return tags;
+    }
 } WebAVStream;
 
 typedef struct WebAVPacket
@@ -124,6 +133,10 @@ std::string gen_rational_str(AVRational rational, char sep)
     return oss.str();
 }
 
+inline std::string safe_str(const char* str) {
+    return str ? str : "";
+}
+
 void gen_web_packet(WebAVPacket &web_packet, AVPacket *packet, AVStream *stream)
 {
     double packet_timestamp = packet->pts * av_q2d(stream->time_base);
@@ -147,24 +160,64 @@ void gen_web_stream(WebAVStream &web_stream, AVStream *stream, AVFormatContext *
     web_stream.index = stream->index;
     web_stream.id = stream->id;
 
-    // codecpar info
+    // Initialize codec info
     AVCodecParameters *par = stream->codecpar;
     web_stream.codec_type = (int)par->codec_type;
-    web_stream.codec_type_string = av_get_media_type_string(par->codec_type);
-    web_stream.codec_name = avcodec_descriptor_get(par->codec_id)->name;
+    web_stream.codec_type_string = safe_str(av_get_media_type_string(par->codec_type));
+    
+    const AVCodecDescriptor* desc = avcodec_descriptor_get(par->codec_id);
+    web_stream.codec_name = safe_str(desc ? desc->name : "");
+
+    // Initialize video-specific values
+    web_stream.width = 0;
+    web_stream.height = 0;
+    web_stream.color_primaries = "";
+    web_stream.color_transfer = "";
+    web_stream.color_space = "";
+    web_stream.color_range = "";
+    web_stream.pix_fmt = "";
+    web_stream.r_frame_rate = "0/0";
+    web_stream.avg_frame_rate = "0/0";
+    web_stream.rotation = 0;
+    web_stream.sample_aspect_ratio = "N/A";
+    web_stream.display_aspect_ratio = "N/A";
+    // Initialize audio-specific values
+    web_stream.channels = 0;
+    web_stream.sample_rate = 0;
+    web_stream.sample_fmt = "";
 
     char codec_string[40];
 
     if (par->codec_type == AVMEDIA_TYPE_VIDEO)
     {
-        web_stream.color_primaries = av_color_primaries_name(par->color_primaries);
-        web_stream.color_transfer = av_color_transfer_name(par->color_trc);
-        web_stream.color_space = av_color_space_name(par->color_space);
-        web_stream.color_range = av_color_range_name(par->color_range);
+        // Video-specific properties
+        web_stream.width = par->width;
+        web_stream.height = par->height;
+        web_stream.color_primaries = safe_str(av_color_primaries_name(par->color_primaries));
+        web_stream.color_transfer = safe_str(av_color_transfer_name(par->color_trc));
+        web_stream.color_space = safe_str(av_color_space_name(par->color_space));
+        web_stream.color_range = safe_str(av_color_range_name(par->color_range));
+        web_stream.pix_fmt = safe_str(av_get_pix_fmt_name((AVPixelFormat)par->format));
+        web_stream.r_frame_rate = gen_rational_str(stream->r_frame_rate, '/');
+        web_stream.avg_frame_rate = gen_rational_str(stream->avg_frame_rate, '/');
+        web_stream.rotation = get_rotation(stream);
+        
+        AVRational sar = av_guess_sample_aspect_ratio(fmt_ctx, stream, NULL);
+        if (sar.num) {
+            AVRational dar;
+            av_reduce(&dar.num, &dar.den, par->width * sar.num, par->height * sar.den, 1024 * 1024);
+            web_stream.sample_aspect_ratio = gen_rational_str(sar, ':');
+            web_stream.display_aspect_ratio = gen_rational_str(dar, ':');
+        }
+        
         set_video_codec_string(codec_string, sizeof(codec_string), par, &stream->avg_frame_rate);
     }
     else if (par->codec_type == AVMEDIA_TYPE_AUDIO)
     {
+        // Audio-specific properties
+        web_stream.channels = par->ch_layout.nb_channels;
+        web_stream.sample_rate = par->sample_rate;
+        web_stream.sample_fmt = safe_str(av_get_sample_fmt_name((AVSampleFormat)par->format));
         set_audio_codec_string(codec_string, sizeof(codec_string), par);
     }
     else
@@ -172,16 +225,12 @@ void gen_web_stream(WebAVStream &web_stream, AVStream *stream, AVFormatContext *
         strcpy(codec_string, "undf");
     }
 
-    web_stream.codec_string = codec_string;
-    web_stream.profile = avcodec_profile_name(par->codec_id, par->profile);
-    web_stream.pix_fmt = av_get_pix_fmt_name((AVPixelFormat)par->format);
+    // Common properties for all types
+    web_stream.codec_string = safe_str(codec_string);
+    web_stream.profile = safe_str(avcodec_profile_name(par->codec_id, par->profile));
     web_stream.level = par->level;
-    web_stream.width = par->width;
-    web_stream.height = par->height;
-    web_stream.channels = par->ch_layout.nb_channels;
-    web_stream.sample_rate = par->sample_rate;
-    web_stream.sample_fmt = av_get_sample_fmt_name((AVSampleFormat)par->format);
     web_stream.bit_rate = std::to_string(par->bit_rate);
+    
     web_stream.extradata_size = par->extradata_size;
     if (par->extradata_size > 0)
     {
@@ -192,10 +241,8 @@ void gen_web_stream(WebAVStream &web_stream, AVStream *stream, AVFormatContext *
         web_stream.extradata = std::vector<uint8_t>();
     }
 
-    // other stream info
     web_stream.start_time = stream->start_time * av_q2d(stream->time_base);
     web_stream.duration = stream->duration > 0 ? stream->duration * av_q2d(stream->time_base) : fmt_ctx->duration * av_q2d(AV_TIME_BASE_Q); // TODO: some file type can not get stream duration
-    web_stream.rotation = get_rotation(stream);
 
     int64_t nb_frames = stream->nb_frames;
 
@@ -205,30 +252,13 @@ void gen_web_stream(WebAVStream &web_stream, AVStream *stream, AVFormatContext *
         nb_frames = (fmt_ctx->duration * (double)stream->avg_frame_rate.num) / ((double)stream->avg_frame_rate.den * AV_TIME_BASE);
     }
     web_stream.nb_frames = std::to_string(nb_frames);
-    web_stream.r_frame_rate = gen_rational_str(stream->r_frame_rate, '/');
-    web_stream.avg_frame_rate = gen_rational_str(stream->avg_frame_rate, '/');
-    AVRational sar, dar;
-    sar = av_guess_sample_aspect_ratio(fmt_ctx, stream, NULL);
-
-    if (sar.num)
-    {
-        av_reduce(&dar.num, &dar.den, par->width * sar.num, par->height * sar.den, 1024 * 1024);
-        web_stream.sample_aspect_ratio = gen_rational_str(sar, ':');
-        web_stream.display_aspect_ratio = gen_rational_str(dar, ':');
-    }
-    else
-    {
-        web_stream.sample_aspect_ratio = std::string("N/A");
-        web_stream.display_aspect_ratio = std::string("N/A");
-    }
 
     AVDictionaryEntry *tag = NULL;
-
     while ((tag = av_dict_get(stream->metadata, "", tag, AV_DICT_IGNORE_SUFFIX)))
     {
         Tag t = {
-            .key = tag->key,
-            .value = tag->value,
+            .key = safe_str(tag->key),
+            .value = safe_str(tag->value)
         };
         web_stream.tags.push_back(t);
     }
@@ -641,7 +671,7 @@ EMSCRIPTEN_BINDINGS(web_demuxer)
         .property("duration", &WebAVStream::duration)
         .property("rotation", &WebAVStream::rotation)
         .property("nb_frames", &WebAVStream::nb_frames)
-        .property("tags", &WebAVStream::tags)
+        .property("tags", &WebAVStream::get_tags)
         .property("color_primaries", &WebAVStream::color_primaries)
         .property("color_transfer", &WebAVStream::color_transfer)
         .property("color_space", &WebAVStream::color_space)
